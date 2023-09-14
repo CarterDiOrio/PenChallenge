@@ -11,11 +11,12 @@ def main():
     pipeline_profile = config.resolve(pipeline_wrapper)
     device = pipeline_profile.get_device()
     device_product_line = str(device.get_info(rs.camera_info.product_line))
+    hole_filter = rs.hole_filling_filter(2)
 
-    w = 1280
-    h = 720
-    config.enable_stream(rs.stream.depth, 1280, 720, rs.format.z16, 30)
-    config.enable_stream(rs.stream.color, 1280, 720, rs.format.bgr8, 30)
+    w = 848
+    h = 480
+    config.enable_stream(rs.stream.depth, w, h, rs.format.z16, 30)
+    config.enable_stream(rs.stream.color, w, h, rs.format.bgr8, 30)
 
     # Note in the example code, cfg is misleadingly called "profile" but cfg is a better name
     cfg = pipeline.start(config)
@@ -82,6 +83,7 @@ def main():
             frames = pipeline.wait_for_frames()
             aligned_frame = align.process(frames)
             depth_frame = aligned_frame.get_depth_frame()
+            depth_frame = hole_filter.process(depth_frame)
             color_frame = aligned_frame.get_color_frame()
             if not depth_frame or not color_frame:
                 continue
@@ -124,20 +126,30 @@ def main():
                 cv2.circle(color_image, (cX, cY), 3, (0, 0, 255), 3)
 
                 total = 0
-                depth = 0
-                for r in range(max(cY - 3, 0), min(cY+3, h)):
-                    for c in range(max(cX - 3, 0), min(cX + 3, w)):
-                        if depth_image[r][c]:
-                            depth += depth_image[r][c]
-                            total += 1
+                depth = depth_image[cY][cX]
+                # for r in range(max(cY - 3, 0), min(cY+3, h)):
+                #     for c in range(max(cX - 3, 0), min(cX + 3, w)):
+                #         if depth_image[r][c]:
+                #             depth += depth_image[r][c]
+                #             total += 1
 
-                if total == 0:
-                    depth = 0
-                else:
-                    depth = depth / total
+                # if total == 0:
+                #     depth = 0
+                # else:
+                #     depth = depth / total
                 point = rs.rs2_deproject_pixel_to_point(
                     intr, [cX, cY], depth)
-                print(point, depth_image[cY][cX], cX, cY)
+
+                text = f"({round(point[0])}, {round(point[1])}, {round(point[2])})"
+                color_image = cv2.putText(
+                    color_image,
+                    text,
+                    (cX+3, cY+3),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    1,
+                    (255, 255, 255),
+                    3, cv2.LINE_AA
+                )
 
             depth_colormap = cv2.applyColorMap(cv2.convertScaleAbs(
                 depth_image, alpha=0.03), cv2.COLORMAP_JET)
