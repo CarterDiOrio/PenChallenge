@@ -5,9 +5,18 @@ import json
 import math
 from scipy.ndimage import median_filter
 import scipy.stats as ss
+from robot import *
+import multiprocessing as mp
+import modern_robotics as mr
 
 
-def main():
+def cart2pol(x, y):
+    rho = np.sqrt(x**2 + y**2)
+    phi = np.arctan2(y, x)
+    return (rho, phi)
+
+
+def vision(queue):
     pipeline = rs.pipeline()
     config = rs.config()
 
@@ -16,7 +25,7 @@ def main():
 
     w = 848
     h = 480
-    fps = 30
+    fps = 60
     config.enable_stream(rs.stream.depth, w, h, rs.format.z16, fps)
     config.enable_stream(rs.stream.color, w, h, rs.format.bgr8, fps)
 
@@ -75,7 +84,7 @@ def main():
     # filter paramters
     h_min = 108
     h_max = 163
-    v_min = 26
+    v_min = 50
     v_max = 216
     s_min = 92
     s_max = 255
@@ -193,19 +202,41 @@ def main():
                 point = rs.rs2_deproject_pixel_to_point(
                     intr, [cX, cY], depth)
 
+                point = np.array(point) / 1000.0
+                temp = point[1]
+                point[1] = point[2]
+                point[2] = temp * -1
+
                 # filter measurement
                 mp = np.array([[np.float32(point[0])], [
                     np.float32(point[1])], [np.float32(point[2])]])
                 kalman.correct(mp)
                 tp = kalman.predict()
-                point = (float(tp[0]), float(tp[1]), float(tp[2]))
+
+                point_column_vec = np.matrix([
+                    [float(tp[0])],
+                    [float(tp[1])],
+                    [float(tp[2])],
+                    [1]
+                ])
+                point = point_to_base(point_column_vec)
+                point = np.squeeze(np.asarray(point))
+                try:
+                    queue.get_nowait()
+                except:
+                    pass
+
+                try:
+                    queue.put_nowait(tuple(point))
+                except:
+                    pass
 
                 if not math.isnan(point[0]) and not math.isnan(point[1]) and not math.isnan(point[2]):
-                    text = f"({round(point[0])}, {round(point[1])}, {round(point[2])})"
+                    text = f"({round(point[0], 2)}, {round(point[1], 2)}, {round(point[2], 2)})"
                     color_image = cv2.putText(
                         color_image,
                         text,
-                        (cX-100, cY+3),
+                        (cX-200, cY+3),
                         cv2.FONT_HERSHEY_SIMPLEX,
                         0.75,
                         (255, 255, 255),
@@ -226,5 +257,65 @@ def main():
         pipeline.stop()
 
 
+def move_linear(robot, desired):
+    joints = robot.arm.get_joint_commands()
+    T = mr.FKinSpace(robot.arm.robot_des.M, robot.arm.robot_des.Slist, joints)
+    [R, p] = mr.TransToRp(T)  # get the rotation matrix and the displacement
+    theta = robot.arm.get_single_joint_command("waist")
+    current_xy = np.array([p[0], p[1]])
+    magnitude = np.linalg.norm(current_xy)
+    desired_x = desired
+    err = desired_x - magnitude
+    robot.arm.set_ee_cartesian_trajectory(x=err)
+
+
+def get_current_rho(robot):
+    joints = robot.arm.get_joint_commands()
+    T = mr.FKinSpace(robot.arm.robot_des.M, robot.arm.robot_des.Slist, joints)
+    [R, p] = mr.TransToRp(T)  # get the rotation matrix and the displacement
+    current_xy = np.array([p[0], p[1]])
+    return np.linalg.norm(current_xy)
+
+
+def robot(queue):
+    robot = InterbotixManipulatorXS("px100", "arm", "gripper")
+    robot.arm.set_single_joint_position(
+        "waist", 0, moving_time=1, blocking=True)
+    robot.arm.go_to_home_pose()
+    move_linear(robot, 0.15)
+    robot.gripper.release()
+
+    pos = 0.0
+    grabbing = False
+    while True:
+        point = queue.get()
+        rho, phi = cart2pol(point[0], point[1])
+        error = phi - pos
+
+        if abs(error) > 0.15:
+            if grabbing:
+                robot.gripper.release()
+                move_linear(robot, 0.15)
+                grabbing = False
+
+            robot.arm.set_single_joint_position(
+                "waist", np.float64(pos + error), blocking=True, accel_time=0.5, moving_time=1)
+            pos = robot.arm.get_single_joint_command("waist")
+        else:
+            # grab
+            if rho < 30:
+                grabbing = True
+                move_linear(robot, rho)
+
+                if rho - get_current_rho(robot) < 0.01:
+                    robot.gripper.grasp()
+
+
 if __name__ == "__main__":
-    main()
+    queue = mp.Queue(maxsize=2)
+    p1 = mp.Process(name="visionP", target=vision, args=(queue,))
+    p2 = mp.Process(name="robotP", target=robot, args=(queue,))
+    p1.start()
+    p2.start()
+    p1.join()
+    p2.join()
