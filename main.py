@@ -3,6 +3,8 @@ import pyrealsense2 as rs
 import numpy as np
 import json
 import math
+from scipy.ndimage import median_filter
+import scipy.stats as ss
 
 
 def main():
@@ -71,11 +73,11 @@ def main():
          [0, 0, 0, 0, 0, 1],], np.float32)
 
     # filter paramters
-    h_min = 106
-    h_max = 136
-    v_min = 84
-    v_max = 255
-    s_min = 85
+    h_min = 108
+    h_max = 163
+    v_min = 26
+    v_max = 216
+    s_min = 92
     s_max = 255
 
     def set_h_min(val):
@@ -169,16 +171,31 @@ def main():
                     color_image, [pen_contour], -1, (0, 255, 0), 3)
                 cv2.circle(color_image, (cX, cY), 3, (0, 0, 255), 3)
 
-                depth = depth_image[cY-5:cY+5, cX-5:cX+5]
-                depth = depth.mean()
-                # depth = depth_image[cY][cX]
+                contour_mask = np.zeros_like(thresh_img)
+                cv2.drawContours(
+                    contour_mask, [pen_contour], -1, color=255, thickness=-1)
+                depth_mask = cv2.bitwise_and(
+                    depth_image, depth_image, mask=contour_mask)
+                depth_mask = cv2.erode(depth_mask, np.ones((3, 3)))
+
+                depth_mask_colormap = cv2.applyColorMap(cv2.convertScaleAbs(
+                    depth_mask, alpha=0.03), cv2.COLORMAP_JET)
+
+                cv2.imshow("depth_mask", depth_mask_colormap)
+                if depth_mask.any():
+                    depth_mask_filtered = depth_mask[depth_mask != 0]
+                    depth_mask_filtered = median_filter(depth_mask_filtered, 1)
+                    depth = ss.tmean(depth_mask_filtered)
+                else:
+                    print("falling back")
+                    depth = depth_mask[cY][cX]
 
                 point = rs.rs2_deproject_pixel_to_point(
                     intr, [cX, cY], depth)
 
                 # filter measurement
                 mp = np.array([[np.float32(point[0])], [
-                              np.float32(point[1])], [np.float32(point[2])]])
+                    np.float32(point[1])], [np.float32(point[2])]])
                 kalman.correct(mp)
                 tp = kalman.predict()
                 point = (float(tp[0]), float(tp[1]), float(tp[2]))
