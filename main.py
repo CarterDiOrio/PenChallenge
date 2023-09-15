@@ -1,17 +1,16 @@
 import cv2 as cv2
 import pyrealsense2 as rs
 import numpy as np
+import json
+import math
 
 
 def main():
     pipeline = rs.pipeline()
     config = rs.config()
 
-    pipeline_wrapper = rs.pipeline_wrapper(pipeline)
-    pipeline_profile = config.resolve(pipeline_wrapper)
-    device = pipeline_profile.get_device()
-    device_product_line = str(device.get_info(rs.camera_info.product_line))
-    hole_filter = rs.hole_filling_filter(2)
+    pipeline = rs.pipeline()
+    config = rs.config()
 
     w = 848
     h = 480
@@ -23,8 +22,25 @@ def main():
     profile = cfg.get_stream(rs.stream.color)
     intr = profile.as_video_stream_profile().get_intrinsics()
 
+    # enable advanced mode and load parameters
+    device = cfg.get_device()
+    advnc_mode = rs.rs400_advanced_mode(device)
+    print("Advanced mode is", "enabled" if advnc_mode.is_enabled() else "disabled")
+
+    with open("high_density_preset.json") as file:
+        json_config_str = file.read()
+        advnc_mode.load_json(json_config_str)
+
+    # device_product_line = str(device.get_info(rs.camera_info.product_line))
+    decimation_filter = rs.decimation_filter(2)
+    hole_filter = rs.hole_filling_filter(2)
+    spatial_filter = rs.spatial_filter(0.4, 21, 2, 4)
+    temporal_filter = rs.temporal_filter(0.40, 31, 3)
+    threshold_filter = rs.threshold_filter(0.1, 1.5)
+
     # Getting the depth sensor's depth scale (see rs-align example for explanation)
     depth_sensor = device.first_depth_sensor()
+    # depth_sensor.set_option(rs.option.depth_units, 1e-3)
     depth_scale = depth_sensor.get_depth_scale()
     print("Depth Scale is: ", depth_scale)
 
@@ -83,12 +99,18 @@ def main():
             frames = pipeline.wait_for_frames()
             aligned_frame = align.process(frames)
             depth_frame = aligned_frame.get_depth_frame()
+            depth_frame = decimation_filter.process(depth_frame)
+            depth_frame = spatial_filter.process(depth_frame)
+            depth_frame = temporal_filter.process(depth_frame)
             depth_frame = hole_filter.process(depth_frame)
+            depth_frame = threshold_filter.process(depth_frame)
             color_frame = aligned_frame.get_color_frame()
             if not depth_frame or not color_frame:
                 continue
 
             depth_image = np.asanyarray(depth_frame.get_data())
+            depth_image = cv2.resize(
+                depth_image, (w, h), interpolation=cv2.INTER_AREA)
             color_image = np.asanyarray(color_frame.get_data())
 
             # convert to hsv
@@ -101,11 +123,13 @@ def main():
             thresh_img = cv2.inRange(
                 blur, (h_min, s_min, v_min), (h_max, s_max, v_max))
 
-            # erosion/dilation for cleanup
+            # erosion/dilation for cleanup salt and pepper noise
             eroded_img = cv2.erode(thresh_img, np.ones((5, 5)))
             dilated_img = cv2.dilate(eroded_img, np.ones((10, 10)))
+
+            # close pen halves
             closed_img = cv2.morphologyEx(dilated_img, cv2.MORPH_CLOSE, cv2.getStructuringElement(
-                cv2.MORPH_RECT, (3, 3)), iterations=10)
+                cv2.MORPH_RECT, (5, 5)), iterations=10)
 
             # contours
             contours, hierarchy = cv2.findContours(
@@ -126,38 +150,33 @@ def main():
                 cv2.circle(color_image, (cX, cY), 3, (0, 0, 255), 3)
 
                 total = 0
-                depth = depth_image[cY][cX]
-                # for r in range(max(cY - 3, 0), min(cY+3, h)):
-                #     for c in range(max(cX - 3, 0), min(cX + 3, w)):
-                #         if depth_image[r][c]:
-                #             depth += depth_image[r][c]
-                #             total += 1
+                depth = depth_image[cY-10:cY+10, cX-10:cX+10]
+                depth = depth.mean()
+                # depth = depth_image[cY][cX]
 
-                # if total == 0:
-                #     depth = 0
-                # else:
-                #     depth = depth / total
                 point = rs.rs2_deproject_pixel_to_point(
                     intr, [cX, cY], depth)
 
-                text = f"({round(point[0])}, {round(point[1])}, {round(point[2])})"
-                color_image = cv2.putText(
-                    color_image,
-                    text,
-                    (cX+3, cY+3),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    1,
-                    (255, 255, 255),
-                    3, cv2.LINE_AA
-                )
+                print(point)
+                if not math.isnan(point[0]) and not math.isnan(point[1]) and not math.isnan(point[2]):
+                    text = f"({round(point[0])}, {round(point[1])}, {round(point[2])})"
+                    color_image = cv2.putText(
+                        color_image,
+                        text,
+                        (cX-100, cY+3),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.75,
+                        (255, 255, 255),
+                        2, cv2.LINE_AA
+                    )
 
             depth_colormap = cv2.applyColorMap(cv2.convertScaleAbs(
                 depth_image, alpha=0.03), cv2.COLORMAP_JET)
             cv2.imshow('RealSense', color_image)
             cv2.imshow('Depth', depth_colormap)
-            cv2.imshow('HSV', hsv_img)
+            # cv2.imshow('HSV', hsv_img)
             cv2.imshow('thresh', thresh_img)
-            cv2.imshow("closed", closed_img)
+            # cv2.imshow("closed", closed_img)
 
             if cv2.waitKey(1) == ord('q'):
                 break
