@@ -14,8 +14,9 @@ def main():
 
     w = 848
     h = 480
-    config.enable_stream(rs.stream.depth, w, h, rs.format.z16, 30)
-    config.enable_stream(rs.stream.color, w, h, rs.format.bgr8, 30)
+    fps = 30
+    config.enable_stream(rs.stream.depth, w, h, rs.format.z16, fps)
+    config.enable_stream(rs.stream.color, w, h, rs.format.bgr8, fps)
 
     # Note in the example code, cfg is misleadingly called "profile" but cfg is a better name
     cfg = pipeline.start(config)
@@ -40,7 +41,7 @@ def main():
 
     # Getting the depth sensor's depth scale (see rs-align example for explanation)
     depth_sensor = device.first_depth_sensor()
-    # depth_sensor.set_option(rs.option.depth_units, 1e-3)
+    # depth_sensor.set_option(rs.option.depth_units, 1e-4)
     depth_scale = depth_sensor.get_depth_scale()
     print("Depth Scale is: ", depth_scale)
 
@@ -55,12 +56,27 @@ def main():
     align_to = rs.stream.color
     align = rs.align(align_to)
 
-    h_min = 113
+    # define kalman filter for smoother pen tracking
+    kalman = cv2.KalmanFilter(6, 3)
+    kalman.measurementMatrix = np.array(
+        [[1, 0, 0, 0, 0, 0],
+         [0, 1, 0, 0, 0, 0],
+         [0, 0, 1, 0, 0, 0]], np.float32)
+    kalman.transitionMatrix = np.array(
+        [[1, 0, 0, 1/fps, 0, 0],
+         [0, 1, 0, 0, 1/fps, 0],
+         [0, 0, 1, 0, 0, 1/fps],
+         [0, 0, 0, 1, 0, 0],
+         [0, 0, 0, 0, 1, 0],
+         [0, 0, 0, 0, 0, 1],], np.float32)
+
+    # filter paramters
+    h_min = 106
     h_max = 136
-    v_min = 16
-    v_max = 142
-    s_min = 86
-    s_max = 227
+    v_min = 84
+    v_max = 255
+    s_min = 85
+    s_max = 255
 
     def set_h_min(val):
         nonlocal h_min
@@ -113,6 +129,10 @@ def main():
                 depth_image, (w, h), interpolation=cv2.INTER_AREA)
             color_image = np.asanyarray(color_frame.get_data())
 
+            # gray = cv2.cvtColor(color_image, cv2.COLOR_BGR2GRAY)
+            # edges = cv2.Canny(color_image, 50, 150)
+            # cv2.imshow("edges", edges)
+
             # convert to hsv
             hsv_img = cv2.cvtColor(color_image, cv2.COLOR_BGR2HSV)
 
@@ -149,15 +169,20 @@ def main():
                     color_image, [pen_contour], -1, (0, 255, 0), 3)
                 cv2.circle(color_image, (cX, cY), 3, (0, 0, 255), 3)
 
-                total = 0
-                depth = depth_image[cY-10:cY+10, cX-10:cX+10]
+                depth = depth_image[cY-5:cY+5, cX-5:cX+5]
                 depth = depth.mean()
                 # depth = depth_image[cY][cX]
 
                 point = rs.rs2_deproject_pixel_to_point(
                     intr, [cX, cY], depth)
 
-                print(point)
+                # filter measurement
+                mp = np.array([[np.float32(point[0])], [
+                              np.float32(point[1])], [np.float32(point[2])]])
+                kalman.correct(mp)
+                tp = kalman.predict()
+                point = (float(tp[0]), float(tp[1]), float(tp[2]))
+
                 if not math.isnan(point[0]) and not math.isnan(point[1]) and not math.isnan(point[2]):
                     text = f"({round(point[0])}, {round(point[1])}, {round(point[2])})"
                     color_image = cv2.putText(
